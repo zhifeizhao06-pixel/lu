@@ -119,6 +119,14 @@ class Config:
     # Contrast Level
     constrast_level: float = 0.5
 
+    # === Luminance-GS++ 物理化改造开关 (默认关闭 -> 向后兼容原版) ===
+    # 模块 A: 用 T_k 驱动的 Bradford 色适应, 在伪标签生成里新插一级 per-view 颜色变换
+    physical_color: bool = False
+    # 模块 B: 用 e_k × 全视角共享 CRF 替换自由曲线路径
+    physical_tone: bool = False
+    # 合成退化: 对干净图施加已知 (T_gt, K_gt), 喂退化图作输入并落盘真值 (可解释性)
+    synth_degrade: bool = False
+
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
     # Use sparse gradients for optimization. (experimental)
