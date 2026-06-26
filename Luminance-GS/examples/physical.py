@@ -18,6 +18,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +148,7 @@ class SharedCRF(nn.Module):
         self.delta = nn.Parameter(torch.zeros(n))
 
     def curve(self) -> torch.Tensor:
-        inc = torch.softplus(self.delta) + 1e-4   # 正增量 -> 单调
+        inc = F.softplus(self.delta) + 1e-4   # 正增量 -> 单调
         c = torch.cumsum(inc, dim=0)
         c = c / c[-1].clamp_min(1e-8)             # 归一到 [0, 1]
         return c                                  # (n,)
