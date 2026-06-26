@@ -68,7 +68,8 @@ class CrossAttention(nn.Module):
 
 
 class CrossAttention_Curve(nn.Module):
-    def __init__(self, img_channels=3, hidden_dim=128, out_dim=3):
+    # out_dim=5: [0]=gamma, [1]=alpha, [2]=beta (原), [3]=T_raw, [4]=e_raw (物理化新增)
+    def __init__(self, img_channels=3, hidden_dim=128, out_dim=5):
         super(CrossAttention_Curve, self).__init__()
         
         self.conv = nn.Sequential(

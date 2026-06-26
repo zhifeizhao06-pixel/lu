@@ -44,6 +44,15 @@ from rendering_double import rasterization_dual
 
 from tools import pixel_project, pixel_project_back, LUT_mapping
 from losses import L_spa, HistogramPriorLoss, gamma_curve, s_curve
+from physical import (
+    SharedCRF,
+    apply_color_adapt,
+    map_T,
+    map_e,
+    synthesize_degradation,
+    sample_degradation_params,
+    InterpretLogger,
+)
 
 
 @dataclass
@@ -341,6 +350,22 @@ class Runner:
         
         self.pesdo_curve = torch.nn.Parameter(torch.linspace(0, 1, 255).unsqueeze(0).cuda(), requires_grad=False)
 
+        # === 物理化模块 B: 全视角共享 CRF (默认实例化, 仅 physical_tone 时接入前向) ===
+        self.shared_crf = SharedCRF(255).to(self.device)
+        self.crf_optimizers = [
+            torch.optim.Adam(
+                self.shared_crf.parameters(),
+                lr=1e-3 * math.sqrt(cfg.batch_size),
+                weight_decay=1e-4,
+            )
+        ]
+        # 合成退化真值缓存: image_id -> (T_gt, K_gt)
+        self.synth_params = {}
+        # 可解释性日志 (仅在任一物理开关开启时落盘 interpret.csv)
+        self.interp_logger = None
+        if cfg.physical_color or cfg.physical_tone or cfg.synth_degrade:
+            self.interp_logger = InterpretLogger(f"{cfg.result_dir}/interpret.csv")
+
         self.axis1_para = [torch.nn.Parameter(torch.tensor([0.0, 0.0, 0.0]).cuda()) for _ in range(len(self.trainset))]
         self.axis2_para = [torch.nn.Parameter(torch.tensor([0.0, 0.0]).cuda()) for _ in range(len(self.trainset))]
 
@@ -503,6 +528,11 @@ class Runner:
                     self.sat_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
+        scheulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.crf_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
+                )
+            )
 
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
@@ -548,6 +578,17 @@ class Runner:
             image_ids = data["image_id"].to(device)
             height, width = pixels.shape[1:3]
 
+            # === 合成退化: 对干净图施加已知 (T_gt, K_gt), 退化图作训练输入, 真值留作可解释性 ===
+            if cfg.synth_degrade:
+                iid = int(image_ids.reshape(-1)[0].item())
+                if iid not in self.synth_params:
+                    T_gt, K_gt = sample_degradation_params(
+                        device=device, exp_name=cfg.exp_name
+                    )
+                    self.synth_params[iid] = (T_gt, K_gt)
+                T_gt, K_gt = self.synth_params[iid]
+                pixels = synthesize_degradation(pixels, T_gt, K_gt)
+
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
@@ -589,19 +630,34 @@ class Runner:
 
             curve_adj = torch.clamp(self.curve + curve_adj_bias, 0, 1)    # Clamp the curve in range of (0, 1)
 
+            # === 物理化参数: T_k (色温) / e_k (曝光), 来自 curve_adjust_gamma 新增的输出头 ===
+            T_k = map_T(gamma_alpha_beta[:, 3])   # ∈ [CCT_MIN, CCT_MAX]
+            e_k = map_e(gamma_alpha_beta[:, 4])   # 正增益, 初始≈1
+
+            # === 模块 B: physical_tone 开启时, 用 e_k × 共享 CRF 取代自由曲线作为色调 LUT ===
+            if cfg.physical_tone:
+                _grid = torch.linspace(0, 1, 255, device=device).unsqueeze(0)
+                tone_curve = self.shared_crf(e_k.reshape(1, 1) * _grid)   # [1, 255]
+            else:
+                tone_curve = curve_adj
+
             normal= (self.axis1_para[image_ids] + torch.Tensor([1, 0, 0]).to(colors_low.device)).unsqueeze(0)
-            
+
             normal2 = (self.axis2_para[image_ids] + torch.Tensor([1, 0]).to(colors_low.device)).unsqueeze(0)
-            
+
             bias = torch.zeros([1, 3]).to(colors_low.device)
-            
+
             t1s, t2s, t3s, bias  = pixel_project(pixels.permute(0,3,1,2), normal, normal2, bias)
-            t1s_out = [LUT_mapping(t1s, curve_adj), t1s[1], t1s[2], t1s[3]] 
-            t2s_out = [LUT_mapping(t2s, curve_adj), t2s[1], t2s[2], t2s[3]] 
-            t3s_out = [LUT_mapping(t3s, curve_adj), t3s[1], t3s[2], t3s[3]] 
+            t1s_out = [LUT_mapping(t1s, tone_curve), t1s[1], t1s[2], t1s[3]]
+            t2s_out = [LUT_mapping(t2s, tone_curve), t2s[1], t2s[2], t2s[3]]
+            t3s_out = [LUT_mapping(t3s, tone_curve), t3s[1], t3s[2], t3s[3]]
 
             pixels_enh = pixel_project_back(t1s_out, t2s_out, t3s_out, bias).permute(0,2,3,1)
-            
+
+            # === 模块 A: physical_color 开启时, 在伪标签上新插一级 T_k 驱动的 Bradford 色适应 ===
+            if cfg.physical_color:
+                pixels_enh = apply_color_adapt(pixels_enh, T_k)
+
             gamma = gamma_alpha_beta[:,0]
             alpha, beta = gamma_alpha_beta[:,1], gamma_alpha_beta[:,2]
             
@@ -624,11 +680,22 @@ class Runner:
             ssimloss_enh = 1.0 - self.ssim(pixels_enh.permute(0,3,1,2), colors_enh.permute(0,3,1,2))
             loss_regress_enh = l1loss_enh * (1.0 - cfg.ssim_lambda) + ssimloss_enh * cfg.ssim_lambda
             
-            hist_loss = loss_histo(curve_adj, pixels, pesdo_curve, step, exp_name=cfg.exp_name)
-            
+            hist_loss = loss_histo(tone_curve, pixels, pesdo_curve, step, exp_name=cfg.exp_name)
+
             loss = loss_regress_low + 0.5*loss_regress_enh + loss_co + 10 * hist_loss
-            
+
             loss.backward()
+
+            # === 可解释性日志: 落盘预测 (T_k, e_k) 与合成真值 (T_gt, K_gt) ===
+            if self.interp_logger is not None and step % cfg.tb_every == 0:
+                iid = int(image_ids.reshape(-1)[0].item())
+                _T_gt, _K_gt = self.synth_params.get(iid, (None, None))
+                self.interp_logger.log(
+                    step, iid,
+                    T_k=T_k if cfg.physical_color else None,
+                    e_k=e_k if cfg.physical_tone else None,
+                    T_gt=_T_gt, K_gt=_K_gt,
+                )
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
 
@@ -744,6 +811,9 @@ class Runner:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.sat_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.crf_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
