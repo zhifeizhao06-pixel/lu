@@ -44,15 +44,6 @@ from rendering_double import rasterization_dual
 
 from tools import pixel_project, pixel_project_back, LUT_mapping
 from losses import L_spa, HistogramPriorLoss, gamma_curve, s_curve
-from physical import (
-    SharedCRF,
-    apply_color_adapt,
-    map_T,
-    map_e,
-    synthesize_degradation,
-    sample_degradation_params,
-    InterpretLogger,
-)
 
 
 @dataclass
@@ -91,7 +82,7 @@ class Config:
     # Steps to evaluate the model
     eval_steps: List[int] = field(default_factory=lambda: [5_000, 7_000, 10_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [5_000, 70_000, 10_000])
+    save_steps: List[int] = field(default_factory=lambda: [5_000, 7_000, 10_000])
 
     # Degree of spherical harmonics
     sh_degree: int = 3
@@ -101,6 +92,18 @@ class Config:
     init_opa: float = 0.1
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+
+    # Low-light noise-aware optimization.  We use the common heteroscedastic
+    # approximation Var[n] = alpha * intensity + beta for shot/read noise.
+    noise_aware: bool = True
+    noise_nll_lambda: float = 0.05
+    noise_alpha_init: float = 0.01
+    noise_beta_init: float = 0.001
+    # Suppress densification when a Gaussian is observed mostly below the
+    # estimated noise floor. Set to 0 to recover the original densification.
+    confidence_densify: bool = True
+    densify_confidence_min: float = 0.15
+    densify_confidence_power: float = 1.0
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -127,14 +130,6 @@ class Config:
     refine_every: int = 100
     # Contrast Level
     constrast_level: float = 0.5
-
-    # === Luminance-GS++ 物理化改造开关 (默认关闭 -> 向后兼容原版) ===
-    # 模块 A: 用 T_k 驱动的 Bradford 色适应, 在伪标签生成里新插一级 per-view 颜色变换
-    physical_color: bool = False
-    # 模块 B: 用 e_k × 全视角共享 CRF 替换自由曲线路径
-    physical_tone: bool = False
-    # 合成退化: 对干净图施加已知 (T_gt, K_gt), 喂退化图作输入并落盘真值 (可解释性)
-    synth_degrade: bool = False
 
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -350,22 +345,6 @@ class Runner:
         
         self.pesdo_curve = torch.nn.Parameter(torch.linspace(0, 1, 255).unsqueeze(0).cuda(), requires_grad=False)
 
-        # === 物理化模块 B: 全视角共享 CRF (默认实例化, 仅 physical_tone 时接入前向) ===
-        self.shared_crf = SharedCRF(255).to(self.device)
-        self.crf_optimizers = [
-            torch.optim.Adam(
-                self.shared_crf.parameters(),
-                lr=1e-3 * math.sqrt(cfg.batch_size),
-                weight_decay=1e-4,
-            )
-        ]
-        # 合成退化真值缓存: image_id -> (T_gt, K_gt)
-        self.synth_params = {}
-        # 可解释性日志 (仅在任一物理开关开启时落盘 interpret.csv)
-        self.interp_logger = None
-        if cfg.physical_color or cfg.physical_tone or cfg.synth_degrade:
-            self.interp_logger = InterpretLogger(f"{cfg.result_dir}/interpret.csv")
-
         self.axis1_para = [torch.nn.Parameter(torch.tensor([0.0, 0.0, 0.0]).cuda()) for _ in range(len(self.trainset))]
         self.axis2_para = [torch.nn.Parameter(torch.tensor([0.0, 0.0]).cuda()) for _ in range(len(self.trainset))]
 
@@ -375,6 +354,25 @@ class Runner:
                     lr=2e-4 * math.sqrt(cfg.batch_size),
                     weight_decay=1e-4,
                 )
+            ]
+
+        # One shot-noise/read-noise pair per training view. Softplus keeps the
+        # values positive; clamping in _noise_model prevents degenerate NLL
+        # solutions during the first iterations.
+        def inv_softplus(x: float) -> float:
+            return math.log(math.expm1(x))
+
+        noise_init = torch.tensor(
+            [inv_softplus(cfg.noise_alpha_init), inv_softplus(cfg.noise_beta_init)],
+            device=self.device,
+        )
+        self.noise_params = torch.nn.Parameter(
+            noise_init[None].repeat(len(self.trainset), 1)
+        )
+        self.noise_optimizers = []
+        if cfg.noise_aware:
+            self.noise_optimizers = [
+                torch.optim.Adam([self.noise_params], lr=2e-4, weight_decay=1e-6)
             ]
         
         self.pose_optimizers = []
@@ -434,7 +432,18 @@ class Runner:
         self.running_stats = {
             "grad2d": torch.zeros(n_gauss, device=self.device),  # norm of the gradient
             "count": torch.zeros(n_gauss, device=self.device, dtype=torch.int),
+            "confidence": torch.zeros(n_gauss, device=self.device),
         }
+
+    def _noise_model(self, pixels: Tensor, image_ids: Tensor):
+        """Return heteroscedastic variance and detached signal confidence."""
+        params = F.softplus(self.noise_params[image_ids.long()])
+        alpha = params[:, 0].clamp(1e-5, 0.25)[:, None, None, None]
+        beta = params[:, 1].clamp(1e-6, 0.05)[:, None, None, None]
+        intensity = pixels.mean(dim=-1, keepdim=True).clamp(0.0, 1.0)
+        variance = (alpha * intensity + beta).clamp_min(1e-6)
+        confidence = intensity / (intensity + variance.sqrt() + 1e-6)
+        return variance, confidence.detach()
 
     def rasterize_splats(
         self,
@@ -518,6 +527,12 @@ class Runner:
                     self.curve_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
+        if cfg.noise_aware:
+            scheulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.noise_optimizers[0], gamma=0.1 ** (1.0 / max_steps)
+                )
+            )
         scheulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.adjust_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
@@ -526,11 +541,6 @@ class Runner:
         scheulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.sat_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-                )
-            )
-        scheulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.crf_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
 
@@ -578,17 +588,6 @@ class Runner:
             image_ids = data["image_id"].to(device)
             height, width = pixels.shape[1:3]
 
-            # === 合成退化: 对干净图施加已知 (T_gt, K_gt), 退化图作训练输入, 真值留作可解释性 ===
-            if cfg.synth_degrade:
-                iid = int(image_ids.reshape(-1)[0].item())
-                if iid not in self.synth_params:
-                    T_gt, K_gt = sample_degradation_params(
-                        device=device, exp_name=cfg.exp_name
-                    )
-                    self.synth_params[iid] = (T_gt, K_gt)
-                T_gt, K_gt = self.synth_params[iid]
-                pixels = synthesize_degradation(pixels, T_gt, K_gt)
-
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
@@ -630,34 +629,19 @@ class Runner:
 
             curve_adj = torch.clamp(self.curve + curve_adj_bias, 0, 1)    # Clamp the curve in range of (0, 1)
 
-            # === 物理化参数: T_k (色温) / e_k (曝光), 来自 curve_adjust_gamma 新增的输出头 ===
-            T_k = map_T(gamma_alpha_beta[:, 3])   # ∈ [CCT_MIN, CCT_MAX]
-            e_k = map_e(gamma_alpha_beta[:, 4])   # 正增益, 初始≈1
-
-            # === 模块 B: physical_tone 开启时, 用 e_k × 共享 CRF 取代自由曲线作为色调 LUT ===
-            if cfg.physical_tone:
-                _grid = torch.linspace(0, 1, 255, device=device).unsqueeze(0)
-                tone_curve = self.shared_crf(e_k.reshape(1, 1) * _grid)   # [1, 255]
-            else:
-                tone_curve = curve_adj
-
             normal= (self.axis1_para[image_ids] + torch.Tensor([1, 0, 0]).to(colors_low.device)).unsqueeze(0)
-
+            
             normal2 = (self.axis2_para[image_ids] + torch.Tensor([1, 0]).to(colors_low.device)).unsqueeze(0)
-
+            
             bias = torch.zeros([1, 3]).to(colors_low.device)
-
+            
             t1s, t2s, t3s, bias  = pixel_project(pixels.permute(0,3,1,2), normal, normal2, bias)
-            t1s_out = [LUT_mapping(t1s, tone_curve), t1s[1], t1s[2], t1s[3]]
-            t2s_out = [LUT_mapping(t2s, tone_curve), t2s[1], t2s[2], t2s[3]]
-            t3s_out = [LUT_mapping(t3s, tone_curve), t3s[1], t3s[2], t3s[3]]
+            t1s_out = [LUT_mapping(t1s, curve_adj), t1s[1], t1s[2], t1s[3]] 
+            t2s_out = [LUT_mapping(t2s, curve_adj), t2s[1], t2s[2], t2s[3]] 
+            t3s_out = [LUT_mapping(t3s, curve_adj), t3s[1], t3s[2], t3s[3]] 
 
             pixels_enh = pixel_project_back(t1s_out, t2s_out, t3s_out, bias).permute(0,2,3,1)
-
-            # === 模块 A: physical_color 开启时, 在伪标签上新插一级 T_k 驱动的 Bradford 色适应 ===
-            if cfg.physical_color:
-                pixels_enh = apply_color_adapt(pixels_enh, T_k)
-
+            
             gamma = gamma_alpha_beta[:,0]
             alpha, beta = gamma_alpha_beta[:,1], gamma_alpha_beta[:,2]
             
@@ -676,26 +660,30 @@ class Runner:
             ssimloss = 1.0 - self.ssim(pixels.permute(0,3,1,2), colors_low.permute(0,3,1,2))
             loss_regress_low = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
+            noise_nll = torch.zeros((), device=device)
+            signal_confidence = None
+            if cfg.noise_aware:
+                noise_variance, signal_confidence = self._noise_model(pixels, image_ids)
+                residual2 = (colors_low - pixels).square().mean(dim=-1, keepdim=True)
+                noise_nll = 0.5 * (
+                    residual2 / noise_variance + torch.log(noise_variance)
+                ).mean()
+
             l1loss_enh = F.l1_loss(colors_enh, pixels_enh)  # enhancement loss constrain
             ssimloss_enh = 1.0 - self.ssim(pixels_enh.permute(0,3,1,2), colors_enh.permute(0,3,1,2))
             loss_regress_enh = l1loss_enh * (1.0 - cfg.ssim_lambda) + ssimloss_enh * cfg.ssim_lambda
             
-            hist_loss = loss_histo(tone_curve, pixels, pesdo_curve, step, exp_name=cfg.exp_name)
-
-            loss = loss_regress_low + 0.5*loss_regress_enh + loss_co + 10 * hist_loss
-
+            hist_loss = loss_histo(curve_adj, pixels, pesdo_curve, step, exp_name=cfg.exp_name)
+            
+            loss = (
+                loss_regress_low
+                + 0.5 * loss_regress_enh
+                + loss_co
+                + 10 * hist_loss
+                + cfg.noise_nll_lambda * noise_nll
+            )
+            
             loss.backward()
-
-            # === 可解释性日志: 落盘预测 (T_k, e_k) 与合成真值 (T_gt, K_gt) ===
-            if self.interp_logger is not None and step % cfg.tb_every == 0:
-                iid = int(image_ids.reshape(-1)[0].item())
-                _T_gt, _K_gt = self.synth_params.get(iid, (None, None))
-                self.interp_logger.log(
-                    step, iid,
-                    T_k=T_k if cfg.physical_color else None,
-                    e_k=e_k if cfg.physical_tone else None,
-                    T_gt=_T_gt, K_gt=_K_gt,
-                )
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
 
@@ -710,6 +698,11 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                if cfg.noise_aware:
+                    self.writer.add_scalar("train/noise_nll", noise_nll.item(), step)
+                    noise_values = F.softplus(self.noise_params[image_ids.long()]).mean(0)
+                    self.writer.add_scalar("train/noise_alpha", noise_values[0].item(), step)
+                    self.writer.add_scalar("train/noise_beta", noise_values[1].item(), step)
                 self.writer.add_scalar(
                     "train/num_GS", len(self.splats["means3d"]), step
                 )
@@ -728,15 +721,25 @@ class Runner:
 
             # update running stats for prunning & growing
             if step < cfg.refine_stop_iter:
-                self.update_running_stats(info)
+                self.update_running_stats(info, signal_confidence)
 
                 if step > cfg.refine_start_iter and step % cfg.refine_every == 0:
                     grads = self.running_stats["grad2d"] / self.running_stats[
                         "count"
                     ].clamp_min(1)
 
+                    mean_confidence = self.running_stats["confidence"] / self.running_stats[
+                        "count"
+                    ].clamp_min(1)
+                    if cfg.confidence_densify and cfg.noise_aware:
+                        grads = grads * mean_confidence.pow(cfg.densify_confidence_power)
+
                     # grow GSs
                     is_grad_high = grads >= cfg.grow_grad2d
+                    if cfg.confidence_densify and cfg.noise_aware:
+                        is_grad_high = is_grad_high & (
+                            mean_confidence >= cfg.densify_confidence_min
+                        )
                     is_small = (
                         torch.exp(self.splats["scales"]).max(dim=-1).values
                         <= cfg.grow_scale3d * self.scene_scale
@@ -781,6 +784,7 @@ class Runner:
                     # reset running stats
                     self.running_stats["grad2d"].zero_()
                     self.running_stats["count"].zero_()
+                    self.running_stats["confidence"].zero_()
 
                 if step % cfg.reset_every == 0:
                     self.reset_opa(cfg.prune_opa * 2.0)
@@ -813,7 +817,7 @@ class Runner:
             for optimizer in self.sat_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.crf_optimizers:
+            for optimizer in self.noise_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
@@ -840,6 +844,12 @@ class Runner:
                     {
                         "step": step,
                         "splats": self.splats.state_dict(),
+                        "curve": self.curve.detach(),
+                        "curve_adjust": self.curve_adjust.state_dict(),
+                        "curve_adjust_gamma": self.curve_adjust_gamma.state_dict(),
+                        "axis1_para": [p.detach() for p in self.axis1_para],
+                        "axis2_para": [p.detach() for p in self.axis2_para],
+                        "noise_params": self.noise_params.detach(),
                     },
                     f"{self.ckpt_dir}/ckpt_{step}.pt",
                 )
@@ -861,7 +871,7 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
-    def update_running_stats(self, info: Dict):
+    def update_running_stats(self, info: Dict, confidence_map: Optional[Tensor] = None):
         """Update running stats."""
         cfg = self.cfg
 
@@ -876,7 +886,16 @@ class Runner:
             # grads is [nnz, 2]
             gs_ids = info["gaussian_ids"]  # [nnz] or None
             self.running_stats["grad2d"].index_add_(0, gs_ids, grads.norm(dim=-1))
-            self.running_stats["count"].index_add_(0, gs_ids, torch.ones_like(gs_ids))
+            self.running_stats["count"].index_add_(
+                0, gs_ids, torch.ones_like(gs_ids, dtype=torch.int)
+            )
+            if confidence_map is not None:
+                camera_ids = info["camera_ids"].long()
+                xy = info["means2d"].detach().round().long()
+                xs = xy[:, 0].clamp(0, info["width"] - 1)
+                ys = xy[:, 1].clamp(0, info["height"] - 1)
+                conf = confidence_map[camera_ids, ys, xs, 0]
+                self.running_stats["confidence"].index_add_(0, gs_ids, conf)
         else:
             # grads is [C, N, 2]
             sel = info["radii"] > 0.0  # [C, N]
@@ -885,6 +904,13 @@ class Runner:
             self.running_stats["count"].index_add_(
                 0, gs_ids, torch.ones_like(gs_ids).int()
             )
+            if confidence_map is not None:
+                camera_ids, _ = torch.where(sel)
+                xy = info["means2d"].detach()[sel].round().long()
+                xs = xy[:, 0].clamp(0, info["width"] - 1)
+                ys = xy[:, 1].clamp(0, info["height"] - 1)
+                conf = confidence_map[camera_ids, ys, xs, 0]
+                self.running_stats["confidence"].index_add_(0, gs_ids, conf)
 
     @torch.no_grad()
     def reset_opa(self, value: float = 0.01):
@@ -1179,6 +1205,25 @@ def main(cfg: Config):
         ckpt = torch.load(cfg.ckpt, map_location=runner.device)
         for k in runner.splats.keys():
             runner.splats[k].data = ckpt["splats"][k]
+        # New checkpoints contain every trainable low-light component. Keep
+        # loading backward compatible with the original public checkpoints.
+        if "curve" in ckpt:
+            runner.curve.data.copy_(ckpt["curve"])
+        if "curve_adjust" in ckpt:
+            runner.curve_adjust.load_state_dict(ckpt["curve_adjust"])
+        if "curve_adjust_gamma" in ckpt:
+            runner.curve_adjust_gamma.load_state_dict(ckpt["curve_adjust_gamma"])
+        if "axis1_para" in ckpt:
+            for dst, src in zip(runner.axis1_para, ckpt["axis1_para"]):
+                dst.data.copy_(src)
+        if "axis2_para" in ckpt:
+            for dst, src in zip(runner.axis2_para, ckpt["axis2_para"]):
+                dst.data.copy_(src)
+        if (
+            "noise_params" in ckpt
+            and runner.noise_params.shape == ckpt["noise_params"].shape
+        ):
+            runner.noise_params.data.copy_(ckpt["noise_params"])
         runner.eval(step=ckpt["step"])
         runner.render_traj(step=ckpt["step"])
     else:
