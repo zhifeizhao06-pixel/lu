@@ -104,6 +104,12 @@ class Config:
     confidence_densify: bool = True
     densify_confidence_min: float = 0.15
     densify_confidence_power: float = 1.0
+    # Accumulate image-plane gradients in a common world coordinate system.
+    # Noise produces poorly aligned directions across views; real structure is
+    # expected to generate a more coherent update direction.
+    gradient_consensus: bool = True
+    densify_consensus_min: float = 0.05
+    densify_consensus_power: float = 0.5
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -433,6 +439,7 @@ class Runner:
             "grad2d": torch.zeros(n_gauss, device=self.device),  # norm of the gradient
             "count": torch.zeros(n_gauss, device=self.device, dtype=torch.int),
             "confidence": torch.zeros(n_gauss, device=self.device),
+            "grad_world": torch.zeros(n_gauss, 3, device=self.device),
         }
 
     def _noise_model(self, pixels: Tensor, image_ids: Tensor):
@@ -721,7 +728,9 @@ class Runner:
 
             # update running stats for prunning & growing
             if step < cfg.refine_stop_iter:
-                self.update_running_stats(info, signal_confidence)
+                self.update_running_stats(
+                    info, signal_confidence, camtoworlds.detach(), Ks.detach()
+                )
 
                 if step > cfg.refine_start_iter and step % cfg.refine_every == 0:
                     grads = self.running_stats["grad2d"] / self.running_stats[
@@ -734,11 +743,22 @@ class Runner:
                     if cfg.confidence_densify and cfg.noise_aware:
                         grads = grads * mean_confidence.pow(cfg.densify_confidence_power)
 
+                    consensus = self.running_stats["grad_world"].norm(dim=-1) / (
+                        self.running_stats["confidence"].clamp_min(1e-6)
+                    )
+                    consensus = consensus.clamp(0.0, 1.0)
+                    if cfg.gradient_consensus and cfg.noise_aware:
+                        grads = grads * consensus.pow(cfg.densify_consensus_power)
+
                     # grow GSs
                     is_grad_high = grads >= cfg.grow_grad2d
                     if cfg.confidence_densify and cfg.noise_aware:
                         is_grad_high = is_grad_high & (
                             mean_confidence >= cfg.densify_confidence_min
+                        )
+                    if cfg.gradient_consensus and cfg.noise_aware:
+                        is_grad_high = is_grad_high & (
+                            consensus >= cfg.densify_consensus_min
                         )
                     is_small = (
                         torch.exp(self.splats["scales"]).max(dim=-1).values
@@ -785,6 +805,7 @@ class Runner:
                     self.running_stats["grad2d"].zero_()
                     self.running_stats["count"].zero_()
                     self.running_stats["confidence"].zero_()
+                    self.running_stats["grad_world"].zero_()
 
                 if step % cfg.reset_every == 0:
                     self.reset_opa(cfg.prune_opa * 2.0)
@@ -837,6 +858,26 @@ class Runner:
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means3d"]),
                 }
+                scales = torch.exp(self.splats["scales"].detach())
+                elongation = scales.max(dim=-1).values / scales.min(
+                    dim=-1
+                ).values.clamp_min(1e-8)
+                stats.update(
+                    {
+                        "elongation_mean": elongation.mean().item(),
+                        "elongation_median": elongation.median().item(),
+                        "elongation_gt5": (elongation > 5).float().mean().item(),
+                        "elongation_gt10": (elongation > 10).float().mean().item(),
+                        "elongation_gt20": (elongation > 20).float().mean().item(),
+                    }
+                )
+                for key in (
+                    "elongation_mean",
+                    "elongation_gt5",
+                    "elongation_gt10",
+                    "elongation_gt20",
+                ):
+                    self.writer.add_scalar(f"geometry/{key}", stats[key], step)
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
                     json.dump(stats, f)
@@ -871,7 +912,13 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
-    def update_running_stats(self, info: Dict, confidence_map: Optional[Tensor] = None):
+    def update_running_stats(
+        self,
+        info: Dict,
+        confidence_map: Optional[Tensor] = None,
+        camtoworlds: Optional[Tensor] = None,
+        Ks: Optional[Tensor] = None,
+    ):
         """Update running stats."""
         cfg = self.cfg
 
@@ -882,6 +929,27 @@ class Runner:
             grads = info["means2d"].grad.clone()
         grads[..., 0] *= info["width"] / 2.0 * cfg.batch_size
         grads[..., 1] *= info["height"] / 2.0 * cfg.batch_size
+
+        def lift_to_world(
+            image_grads: Tensor, camera_ids: Tensor, confidence: Tensor
+        ) -> Tensor:
+            """Approximately lift 2D gradient directions into world space."""
+            if camtoworlds is None or Ks is None:
+                return torch.zeros(
+                    len(image_grads), 3, device=image_grads.device, dtype=image_grads.dtype
+                )
+            camera_ids = camera_ids.long()
+            fx = Ks[camera_ids, 0, 0].clamp_min(1e-6)
+            fy = Ks[camera_ids, 1, 1].clamp_min(1e-6)
+            right = camtoworlds[camera_ids, :3, 0]
+            up = camtoworlds[camera_ids, :3, 1]
+            world = (
+                image_grads[:, 0:1] / fx[:, None] * right
+                + image_grads[:, 1:2] / fy[:, None] * up
+            )
+            world = F.normalize(world, dim=-1, eps=1e-8)
+            return world * confidence[:, None]
+
         if cfg.packed:
             # grads is [nnz, 2]
             gs_ids = info["gaussian_ids"]  # [nnz] or None
@@ -896,6 +964,8 @@ class Runner:
                 ys = xy[:, 1].clamp(0, info["height"] - 1)
                 conf = confidence_map[camera_ids, ys, xs, 0]
                 self.running_stats["confidence"].index_add_(0, gs_ids, conf)
+                world_grads = lift_to_world(grads, camera_ids, conf)
+                self.running_stats["grad_world"].index_add_(0, gs_ids, world_grads)
         else:
             # grads is [C, N, 2]
             sel = info["radii"] > 0.0  # [C, N]
@@ -911,6 +981,8 @@ class Runner:
                 ys = xy[:, 1].clamp(0, info["height"] - 1)
                 conf = confidence_map[camera_ids, ys, xs, 0]
                 self.running_stats["confidence"].index_add_(0, gs_ids, conf)
+                world_grads = lift_to_world(grads[sel], camera_ids, conf)
+                self.running_stats["grad_world"].index_add_(0, gs_ids, world_grads)
 
     @torch.no_grad()
     def reset_opa(self, value: float = 0.01):
