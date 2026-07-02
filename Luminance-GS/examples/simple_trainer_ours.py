@@ -107,15 +107,23 @@ class Config:
     # Accumulate image-plane gradients in a common world coordinate system.
     # Noise produces poorly aligned directions across views; real structure is
     # expected to generate a more coherent update direction.
-    gradient_consensus: bool = True
+    gradient_consensus: bool = False
     densify_consensus_min: float = 0.05
     densify_consensus_power: float = 0.5
     # Penalize needle-like Gaussians without penalizing thin, surface-aligned
     # discs. The ratio is s_max / s_mid, not s_max / s_min.
     needle_regularization: bool = True
-    needle_reg_lambda: float = 1e-3
+    needle_reg_lambda: float = 5e-4
     needle_ratio_max: float = 5.0
     needle_reg_start: int = 1_000
+    # Empirical Fisher information from the noise likelihood approximates how
+    # observable each Gaussian's position and shape are under low-light noise.
+    information_guidance: bool = True
+    fisher_ema_decay: float = 0.95
+    information_start: int = 1_000
+    information_min_support: int = 3
+    information_min: float = 0.01
+    information_power: float = 0.25
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -446,6 +454,9 @@ class Runner:
             "count": torch.zeros(n_gauss, device=self.device, dtype=torch.int),
             "confidence": torch.zeros(n_gauss, device=self.device),
             "grad_world": torch.zeros(n_gauss, 3, device=self.device),
+            "fisher_position": torch.zeros(n_gauss, device=self.device),
+            "fisher_shape": torch.zeros(n_gauss, device=self.device),
+            "view_support": torch.zeros(n_gauss, device=self.device),
         }
 
     def _noise_model(self, pixels: Tensor, image_ids: Tensor):
@@ -713,8 +724,32 @@ class Runner:
                 + cfg.noise_nll_lambda * noise_nll
                 + cfg.needle_reg_lambda * needle_loss
             )
-            
+
+            information_grads = None
+            if (
+                cfg.information_guidance
+                and cfg.noise_aware
+                and step >= cfg.information_start
+            ):
+                # The squared score of the heteroscedastic likelihood is an
+                # empirical diagonal-Fisher approximation. Across randomly
+                # sampled views it measures whether geometry is consistently
+                # observable above the estimated sensor noise.
+                information_grads = torch.autograd.grad(
+                    noise_nll,
+                    (
+                        self.splats["means3d"],
+                        self.splats["scales"],
+                        self.splats["quats"],
+                    ),
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+
             loss.backward()
+
+            if information_grads is not None:
+                self.update_fisher_stats(info, information_grads)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
 
@@ -776,6 +811,12 @@ class Runner:
                     if cfg.gradient_consensus and cfg.noise_aware:
                         grads = grads * consensus.pow(cfg.densify_consensus_power)
 
+                    information_confidence = self.get_information_confidence()
+                    if cfg.information_guidance and cfg.noise_aware:
+                        grads = grads * information_confidence.pow(
+                            cfg.information_power
+                        )
+
                     # grow GSs
                     is_grad_high = grads >= cfg.grow_grad2d
                     if cfg.confidence_densify and cfg.noise_aware:
@@ -785,6 +826,14 @@ class Runner:
                     if cfg.gradient_consensus and cfg.noise_aware:
                         is_grad_high = is_grad_high & (
                             consensus >= cfg.densify_consensus_min
+                        )
+                    if cfg.information_guidance and cfg.noise_aware:
+                        has_support = self.running_stats["view_support"] >= (
+                            cfg.information_min_support
+                        )
+                        is_grad_high = is_grad_high & (
+                            (~has_support)
+                            | (information_confidence >= cfg.information_min)
                         )
                     is_small = (
                         torch.exp(self.splats["scales"]).max(dim=-1).values
@@ -920,6 +969,28 @@ class Runner:
                         ).item(),
                     }
                 )
+                if cfg.information_guidance:
+                    info_confidence = self.get_information_confidence()
+                    supported = self.running_stats["view_support"] >= (
+                        cfg.information_min_support
+                    )
+                    if supported.any():
+                        supported_confidence = info_confidence[supported]
+                        stats.update(
+                            {
+                                "information_supported_fraction": supported.float()
+                                .mean()
+                                .item(),
+                                "information_mean": supported_confidence.mean().item(),
+                                "information_median": supported_confidence.median().item(),
+                                "information_below_min": (
+                                    supported_confidence < cfg.information_min
+                                )
+                                .float()
+                                .mean()
+                                .item(),
+                            }
+                        )
                 for key in (
                     "elongation_mean",
                     "elongation_gt5",
@@ -935,6 +1006,14 @@ class Runner:
                     "opacity_weighted_needle",
                 ):
                     self.writer.add_scalar(f"geometry/{key}", stats[key], step)
+                for key in (
+                    "information_supported_fraction",
+                    "information_mean",
+                    "information_median",
+                    "information_below_min",
+                ):
+                    if key in stats:
+                        self.writer.add_scalar(f"information/{key}", stats[key], step)
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
                     json.dump(stats, f)
@@ -967,6 +1046,61 @@ class Runner:
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+    @torch.no_grad()
+    def update_fisher_stats(self, info: Dict, information_grads):
+        """Update per-Gaussian empirical Fisher information for geometry."""
+        if self.cfg.packed:
+            visible_ids = info["gaussian_ids"].unique()
+            visible = torch.zeros(
+                len(self.splats["means3d"]), device=self.device, dtype=torch.bool
+            )
+            visible[visible_ids] = True
+        else:
+            visible = (info["radii"] > 0).any(dim=0)
+
+        def squared_score(grad: Optional[Tensor]) -> Tensor:
+            if grad is None:
+                return torch.zeros(len(visible), device=self.device)
+            if grad.is_sparse:
+                grad = grad.to_dense()
+            return grad.detach().float().square().flatten(1).mean(dim=-1)
+
+        position_score = squared_score(information_grads[0])
+        shape_score = squared_score(information_grads[1]) + squared_score(
+            information_grads[2]
+        )
+        decay = self.cfg.fisher_ema_decay
+        self.running_stats["fisher_position"][visible] = (
+            decay * self.running_stats["fisher_position"][visible]
+            + (1.0 - decay) * position_score[visible]
+        )
+        self.running_stats["fisher_shape"][visible] = (
+            decay * self.running_stats["fisher_shape"][visible]
+            + (1.0 - decay) * shape_score[visible]
+        )
+        self.running_stats["view_support"][visible] += 1.0
+
+    @torch.no_grad()
+    def get_information_confidence(self) -> Tensor:
+        """Normalize position/shape Fisher values into a robust [0, 1] score."""
+        support = self.running_stats["view_support"] >= (
+            self.cfg.information_min_support
+        )
+
+        def normalize(values: Tensor) -> Tensor:
+            positive = support & torch.isfinite(values) & (values > 0)
+            confidence = torch.ones_like(values)
+            if positive.any():
+                reference = values[positive].median().clamp_min(1e-20)
+                confidence[support] = values[support] / (
+                    values[support] + reference
+                )
+            return confidence.clamp(0.0, 1.0)
+
+        position_confidence = normalize(self.running_stats["fisher_position"])
+        shape_confidence = normalize(self.running_stats["fisher_shape"])
+        return torch.sqrt(position_confidence * shape_confidence)
 
     @torch.no_grad()
     def update_running_stats(
