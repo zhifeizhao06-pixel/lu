@@ -12,7 +12,9 @@ enabled by default. It adds:
 5. Cross-view gradient consensus: projected gradients are approximately lifted
    into world space and inconsistent directions are suppressed during growth.
 6. Automatic elongation diagnostics at every checkpoint.
-7. Complete checkpointing for the curve, adjustment networks, per-view color
+7. A needle-only shape regularizer on `s_max / s_mid` that preserves thin
+   surface-aligned discs (`s_mid / s_min`).
+8. Complete checkpointing for the curve, adjustment networks, per-view color
    parameters, and noise parameters.
 
 ## A/B commands
@@ -29,7 +31,8 @@ python simple_trainer_ours.py \
   --result-dir ../results/buu_baseline \
   --no-noise-aware \
   --no-confidence-densify \
-  --no-gradient-consensus
+  --no-gradient-consensus \
+  --no-needle-regularization
 ```
 
 Noise-aware experiment:
@@ -54,11 +57,17 @@ python simple_trainer_ours.py --help
 ## Useful ablations
 
 - Noise loss only:
-  `--noise-aware --no-confidence-densify --no-gradient-consensus`
+  `--noise-aware --no-confidence-densify --no-gradient-consensus
+  --no-needle-regularization`
 - Confidence without cross-view consensus:
-  `--noise-aware --confidence-densify --no-gradient-consensus`
+  `--noise-aware --confidence-densify --no-gradient-consensus
+  --no-needle-regularization`
+- Confidence plus needle regularization (recommended next experiment):
+  `--noise-aware --confidence-densify --no-gradient-consensus
+  --needle-regularization`
 - Original loss and densification:
-  `--no-noise-aware --no-confidence-densify --no-gradient-consensus`
+  `--no-noise-aware --no-confidence-densify --no-gradient-consensus
+  --no-needle-regularization`
 - Stronger densification filtering:
   `--densify-confidence-min 0.25 --densify-confidence-power 1.5`
 - Weaker filtering:

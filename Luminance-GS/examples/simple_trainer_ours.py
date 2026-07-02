@@ -110,6 +110,12 @@ class Config:
     gradient_consensus: bool = True
     densify_consensus_min: float = 0.05
     densify_consensus_power: float = 0.5
+    # Penalize needle-like Gaussians without penalizing thin, surface-aligned
+    # discs. The ratio is s_max / s_mid, not s_max / s_min.
+    needle_regularization: bool = True
+    needle_reg_lambda: float = 1e-3
+    needle_ratio_max: float = 5.0
+    needle_reg_start: int = 1_000
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -676,6 +682,23 @@ class Runner:
                     residual2 / noise_variance + torch.log(noise_variance)
                 ).mean()
 
+            needle_loss = torch.zeros((), device=device)
+            if cfg.needle_regularization and step >= cfg.needle_reg_start:
+                # Work in log-scale space for stable gradients. Sorting is
+                # piecewise differentiable and routes gradients to the two
+                # axes that form the needle ratio.
+                sorted_log_scales = self.splats["scales"].sort(dim=-1).values
+                log_needle_ratio = sorted_log_scales[:, 2] - sorted_log_scales[:, 1]
+                excess = F.relu(
+                    log_needle_ratio - math.log(cfg.needle_ratio_max)
+                )
+                # Visible/opaque needles matter more, while a small floor also
+                # prevents nearly transparent outliers from growing unchecked.
+                opacity_weight = 0.1 + 0.9 * torch.sigmoid(
+                    self.splats["opacities"].detach()
+                )
+                needle_loss = (opacity_weight * excess.square()).mean()
+
             l1loss_enh = F.l1_loss(colors_enh, pixels_enh)  # enhancement loss constrain
             ssimloss_enh = 1.0 - self.ssim(pixels_enh.permute(0,3,1,2), colors_enh.permute(0,3,1,2))
             loss_regress_enh = l1loss_enh * (1.0 - cfg.ssim_lambda) + ssimloss_enh * cfg.ssim_lambda
@@ -688,6 +711,7 @@ class Runner:
                 + loss_co
                 + 10 * hist_loss
                 + cfg.noise_nll_lambda * noise_nll
+                + cfg.needle_reg_lambda * needle_loss
             )
             
             loss.backward()
@@ -710,6 +734,8 @@ class Runner:
                     noise_values = F.softplus(self.noise_params[image_ids.long()]).mean(0)
                     self.writer.add_scalar("train/noise_alpha", noise_values[0].item(), step)
                     self.writer.add_scalar("train/noise_beta", noise_values[1].item(), step)
+                if cfg.needle_regularization:
+                    self.writer.add_scalar("train/needle_loss", needle_loss.item(), step)
                 self.writer.add_scalar(
                     "train/num_GS", len(self.splats["means3d"]), step
                 )
