@@ -22,6 +22,10 @@ enabled by default. It adds:
     Fisher gates scale/rotation updates, while appearance remains unconstrained.
     Direct Fisher densification is retained only as a disabled ablation.
 
+The validated default method enables noise-aware confidence densification and
+needle regularization (`5e-4`). Gradient consensus and both Fisher applications
+are disabled by default because they reduced validation quality on `buu`.
+
 ## A/B commands
 
 Run from `examples/`. Keep every option and random seed identical except the

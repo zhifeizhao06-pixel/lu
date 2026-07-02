@@ -118,7 +118,7 @@ class Config:
     needle_reg_start: int = 1_000
     # Empirical Fisher information from the noise likelihood approximates how
     # observable each Gaussian's position and shape are under low-light noise.
-    information_guidance: bool = True
+    information_guidance: bool = False
     fisher_ema_decay: float = 0.95
     information_start: int = 1_000
     information_min_support: int = 3
@@ -128,7 +128,7 @@ class Config:
     # is retained for ablation but disabled after it hurt perceptual quality.
     information_densify: bool = False
     # Recommended use: decouple geometry updates from appearance updates.
-    information_gradient_gating: bool = True
+    information_gradient_gating: bool = False
     information_gate_floor: float = 0.5
     information_gate_power: float = 0.5
 
