@@ -124,6 +124,13 @@ class Config:
     information_min_support: int = 3
     information_min: float = 0.01
     information_power: float = 0.25
+    # Fisher can be used in two distinct ways. Direct densification weighting
+    # is retained for ablation but disabled after it hurt perceptual quality.
+    information_densify: bool = False
+    # Recommended use: decouple geometry updates from appearance updates.
+    information_gradient_gating: bool = True
+    information_gate_floor: float = 0.5
+    information_gate_power: float = 0.5
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -821,7 +828,11 @@ class Runner:
                         grads = grads * consensus.pow(cfg.densify_consensus_power)
 
                     information_confidence = self.get_information_confidence()
-                    if cfg.information_guidance and cfg.noise_aware:
+                    if (
+                        cfg.information_guidance
+                        and cfg.information_densify
+                        and cfg.noise_aware
+                    ):
                         grads = grads * information_confidence.pow(
                             cfg.information_power
                         )
@@ -836,7 +847,11 @@ class Runner:
                         is_grad_high = is_grad_high & (
                             consensus >= cfg.densify_consensus_min
                         )
-                    if cfg.information_guidance and cfg.noise_aware:
+                    if (
+                        cfg.information_guidance
+                        and cfg.information_densify
+                        and cfg.noise_aware
+                    ):
                         has_support = self.running_stats["view_support"] >= (
                             cfg.information_min_support
                         )
@@ -893,6 +908,45 @@ class Runner:
 
                 if step % cfg.reset_every == 0:
                     self.reset_opa(cfg.prune_opa * 2.0)
+
+            # Parameter-update decoupling: geometry with weak Fisher support
+            # receives conservative updates, while SH/color and exposure
+            # parameters remain free to explain appearance changes.
+            if (
+                cfg.information_guidance
+                and cfg.information_gradient_gating
+                and cfg.noise_aware
+                and step >= cfg.information_start
+            ):
+                position_confidence, shape_confidence = (
+                    self.get_information_confidence_components()
+                )
+                position_gate = cfg.information_gate_floor + (
+                    1.0 - cfg.information_gate_floor
+                ) * position_confidence.pow(cfg.information_gate_power)
+                shape_gate = cfg.information_gate_floor + (
+                    1.0 - cfg.information_gate_floor
+                ) * shape_confidence.pow(cfg.information_gate_power)
+
+                geometry_gates = {
+                    "means3d": position_gate,
+                    "scales": shape_gate,
+                    "quats": shape_gate,
+                }
+                for name, gate in geometry_gates.items():
+                    grad = self.splats[name].grad
+                    if grad is None or grad.is_sparse:
+                        continue
+                    gate_shape = [len(gate)] + [1] * (grad.dim() - 1)
+                    grad.mul_(gate.view(gate_shape))
+
+                if cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                    self.writer.add_scalar(
+                        "information/position_gate_mean", position_gate.mean().item(), step
+                    )
+                    self.writer.add_scalar(
+                        "information/shape_gate_mean", shape_gate.mean().item(), step
+                    )
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -980,6 +1034,9 @@ class Runner:
                 )
                 if cfg.information_guidance:
                     info_confidence = self.get_information_confidence()
+                    position_confidence, shape_confidence = (
+                        self.get_information_confidence_components()
+                    )
                     supported = self.running_stats["view_support"] >= (
                         cfg.information_min_support
                     )
@@ -996,6 +1053,24 @@ class Runner:
                                     supported_confidence < cfg.information_min
                                 )
                                 .float()
+                                .mean()
+                                .item(),
+                                "position_gate_mean": (
+                                    cfg.information_gate_floor
+                                    + (1.0 - cfg.information_gate_floor)
+                                    * position_confidence[supported].pow(
+                                        cfg.information_gate_power
+                                    )
+                                )
+                                .mean()
+                                .item(),
+                                "shape_gate_mean": (
+                                    cfg.information_gate_floor
+                                    + (1.0 - cfg.information_gate_floor)
+                                    * shape_confidence[supported].pow(
+                                        cfg.information_gate_power
+                                    )
+                                )
                                 .mean()
                                 .item(),
                             }
@@ -1020,6 +1095,8 @@ class Runner:
                     "information_mean",
                     "information_median",
                     "information_below_min",
+                    "position_gate_mean",
+                    "shape_gate_mean",
                 ):
                     if key in stats:
                         self.writer.add_scalar(f"information/{key}", stats[key], step)
@@ -1091,8 +1168,8 @@ class Runner:
         self.running_stats["view_support"][visible] += 1.0
 
     @torch.no_grad()
-    def get_information_confidence(self) -> Tensor:
-        """Normalize position/shape Fisher values into a robust [0, 1] score."""
+    def get_information_confidence_components(self):
+        """Return separately normalized position and shape information."""
         support = self.running_stats["view_support"] >= (
             self.cfg.information_min_support
         )
@@ -1109,6 +1186,14 @@ class Runner:
 
         position_confidence = normalize(self.running_stats["fisher_position"])
         shape_confidence = normalize(self.running_stats["fisher_shape"])
+        return position_confidence, shape_confidence
+
+    @torch.no_grad()
+    def get_information_confidence(self) -> Tensor:
+        """Combine position/shape information into a robust [0, 1] score."""
+        position_confidence, shape_confidence = (
+            self.get_information_confidence_components()
+        )
         return torch.sqrt(position_confidence * shape_confidence)
 
     @torch.no_grad()

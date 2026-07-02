@@ -17,7 +17,10 @@ enabled by default. It adds:
 8. Complete checkpointing for the curve, adjustment networks, per-view color
    parameters, and noise parameters.
 9. Empirical Fisher information for Gaussian position and shape, estimated from
-   the heteroscedastic low-light likelihood and used to guide densification.
+   the heteroscedastic low-light likelihood.
+10. Parameter-update decoupling: position Fisher gates center updates and shape
+    Fisher gates scale/rotation updates, while appearance remains unconstrained.
+    Direct Fisher densification is retained only as a disabled ablation.
 
 ## A/B commands
 
@@ -69,7 +72,8 @@ python simple_trainer_ours.py --help
   --needle-regularization --no-information-guidance`
 - Information-guided version:
   `--noise-aware --confidence-densify --no-gradient-consensus
-  --needle-regularization --information-guidance`
+  --needle-regularization --information-guidance
+  --information-gradient-gating --no-information-densify`
 - Original loss and densification:
   `--no-noise-aware --no-confidence-densify --no-gradient-consensus
   --no-needle-regularization`
@@ -92,7 +96,8 @@ python simple_trainer_ours.py --help
   nearly invisible outliers.
 - `train/noise_alpha`, `train/noise_beta`, and `train/noise_nll` in TensorBoard.
 - `information_supported_fraction`, `information_mean`,
-  `information_median`, and `information_below_min` in checkpoint statistics.
+  `information_median`, `information_below_min`, `position_gate_mean`, and
+  `shape_gate_mean` in checkpoint statistics.
 
 The minimum hypothesis is supported if the noise-aware run reduces floaters or
 the number of Gaussians without materially reducing validation quality. Test at
