@@ -745,6 +745,15 @@ class Runner:
                     retain_graph=True,
                     allow_unused=True,
                 )
+                # The rasterizer exposes retained screen-space gradients for
+                # densification. Although autograd.grad does not accumulate
+                # into the requested leaf parameters, backward hooks of the
+                # custom rasterizer can populate means2d.grad/absgrad. Clear
+                # those auxiliary values so the following full backward pass
+                # is the sole source used by update_running_stats().
+                info["means2d"].grad = None
+                if hasattr(info["means2d"], "absgrad"):
+                    info["means2d"].absgrad = None
 
             loss.backward()
 
