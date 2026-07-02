@@ -71,6 +71,11 @@ python simple_trainer_ours.py --help
 - Floaters and needle-like artifacts in trajectory videos.
 - `elongation_mean`, `elongation_gt5`, `elongation_gt10`, and
   `elongation_gt20` in `stats/train_step*.json`.
+- Prefer `needle_gt5`, `needle_gt10`, `opaque_needle_gt5`, and
+  `opaque_needle_gt10` when diagnosing abnormal stretched Gaussians.
+  `flat_*` measures thin surface-like discs and should not be counted as
+  floaters by itself. `opacity_weighted_needle` reduces the influence of
+  nearly invisible outliers.
 - `train/noise_alpha`, `train/noise_beta`, and `train/noise_nll` in TensorBoard.
 
 The minimum hypothesis is supported if the noise-aware run reduces floaters or

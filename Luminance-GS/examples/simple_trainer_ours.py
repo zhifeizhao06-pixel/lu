@@ -859,9 +859,15 @@ class Runner:
                     "num_GS": len(self.splats["means3d"]),
                 }
                 scales = torch.exp(self.splats["scales"].detach())
-                elongation = scales.max(dim=-1).values / scales.min(
-                    dim=-1
-                ).values.clamp_min(1e-8)
+                sorted_scales = scales.sort(dim=-1).values
+                elongation = sorted_scales[:, 2] / sorted_scales[:, 0].clamp_min(1e-8)
+                # max/mid detects needle-like Gaussians, while mid/min detects
+                # thin surface-aligned discs. max/min alone conflates the two.
+                needle_ratio = sorted_scales[:, 2] / sorted_scales[:, 1].clamp_min(1e-8)
+                flat_ratio = sorted_scales[:, 1] / sorted_scales[:, 0].clamp_min(1e-8)
+                opacity = torch.sigmoid(self.splats["opacities"].detach())
+                opaque = opacity > 0.1
+                opaque_count = opaque.sum().clamp_min(1)
                 stats.update(
                     {
                         "elongation_mean": elongation.mean().item(),
@@ -869,6 +875,23 @@ class Runner:
                         "elongation_gt5": (elongation > 5).float().mean().item(),
                         "elongation_gt10": (elongation > 10).float().mean().item(),
                         "elongation_gt20": (elongation > 20).float().mean().item(),
+                        "needle_mean": needle_ratio.mean().item(),
+                        "needle_median": needle_ratio.median().item(),
+                        "needle_gt5": (needle_ratio > 5).float().mean().item(),
+                        "needle_gt10": (needle_ratio > 10).float().mean().item(),
+                        "flat_mean": flat_ratio.mean().item(),
+                        "flat_median": flat_ratio.median().item(),
+                        "flat_gt10": (flat_ratio > 10).float().mean().item(),
+                        "opaque_fraction": opaque.float().mean().item(),
+                        "opaque_needle_gt5": (
+                            ((needle_ratio > 5) & opaque).sum() / opaque_count
+                        ).item(),
+                        "opaque_needle_gt10": (
+                            ((needle_ratio > 10) & opaque).sum() / opaque_count
+                        ).item(),
+                        "opacity_weighted_needle": (
+                            (needle_ratio * opacity).sum() / opacity.sum().clamp_min(1e-8)
+                        ).item(),
                     }
                 )
                 for key in (
@@ -876,6 +899,14 @@ class Runner:
                     "elongation_gt5",
                     "elongation_gt10",
                     "elongation_gt20",
+                    "needle_mean",
+                    "needle_gt5",
+                    "needle_gt10",
+                    "flat_mean",
+                    "flat_gt10",
+                    "opaque_needle_gt5",
+                    "opaque_needle_gt10",
+                    "opacity_weighted_needle",
                 ):
                     self.writer.add_scalar(f"geometry/{key}", stats[key], step)
                 print("Step: ", step, stats)
