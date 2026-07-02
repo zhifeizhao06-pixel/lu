@@ -16,6 +16,8 @@ enabled by default. It adds:
    surface-aligned discs (`s_mid / s_min`).
 8. Complete checkpointing for the curve, adjustment networks, per-view color
    parameters, and noise parameters.
+9. Empirical Fisher information for Gaussian position and shape, estimated from
+   the heteroscedastic low-light likelihood and used to guide densification.
 
 ## A/B commands
 
@@ -61,10 +63,13 @@ python simple_trainer_ours.py --help
   --no-needle-regularization`
 - Confidence without cross-view consensus:
   `--noise-aware --confidence-densify --no-gradient-consensus
-  --no-needle-regularization`
+  --no-needle-regularization --no-information-guidance`
 - Confidence plus needle regularization (recommended next experiment):
   `--noise-aware --confidence-densify --no-gradient-consensus
-  --needle-regularization`
+  --needle-regularization --no-information-guidance`
+- Information-guided version:
+  `--noise-aware --confidence-densify --no-gradient-consensus
+  --needle-regularization --information-guidance`
 - Original loss and densification:
   `--no-noise-aware --no-confidence-densify --no-gradient-consensus
   --no-needle-regularization`
@@ -86,6 +91,8 @@ python simple_trainer_ours.py --help
   floaters by itself. `opacity_weighted_needle` reduces the influence of
   nearly invisible outliers.
 - `train/noise_alpha`, `train/noise_beta`, and `train/noise_nll` in TensorBoard.
+- `information_supported_fraction`, `information_mean`,
+  `information_median`, and `information_below_min` in checkpoint statistics.
 
 The minimum hypothesis is supported if the noise-aware run reduces floaters or
 the number of Gaussians without materially reducing validation quality. Test at
