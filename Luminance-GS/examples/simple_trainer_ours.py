@@ -109,6 +109,11 @@ class Config:
     confidence_curriculum: bool = False
     confidence_curriculum_start: int = 500
     confidence_curriculum_end: int = 4_000
+    # Per-Gaussian alternative to the global curriculum. Observation support
+    # is accumulated within each refinement window; weakly observed Gaussians
+    # are not rejected until their confidence estimate becomes reliable.
+    evidence_adaptive_confidence: bool = False
+    evidence_support_tau: float = 10.0
     # Protect dark but structurally reliable edges. Image gradients are
     # normalized by the predicted noise of a pixel difference, sqrt(2)*sigma.
     structure_protection: bool = False
@@ -895,6 +900,17 @@ class Runner:
                             * (1.0 - mean_confidence)
                             * color_evidence
                         )
+                    support_reliability = None
+                    if cfg.evidence_adaptive_confidence:
+                        observation_support = self.running_stats["count"].float()
+                        support_reliability = observation_support / (
+                            observation_support + cfg.evidence_support_tau
+                        )
+                        densify_gaussian_confidence = (
+                            densify_gaussian_confidence
+                            + (1.0 - support_reliability)
+                            * (1.0 - densify_gaussian_confidence)
+                        )
                     active_confidence_power = cfg.densify_confidence_power
                     active_confidence_min = cfg.densify_confidence_min
                     curriculum_weight = 1.0
@@ -987,6 +1003,17 @@ class Runner:
                         self.writer.add_scalar(
                             "confidence_curriculum/active_min",
                             active_confidence_min,
+                            step,
+                        )
+                    if support_reliability is not None and cfg.tb_every > 0:
+                        self.writer.add_scalar(
+                            "evidence_adaptive/support_reliability_mean",
+                            support_reliability.mean().item(),
+                            step,
+                        )
+                        self.writer.add_scalar(
+                            "evidence_adaptive/densify_confidence_mean",
+                            densify_gaussian_confidence.mean().item(),
                             step,
                         )
                     is_small = (
