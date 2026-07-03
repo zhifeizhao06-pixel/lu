@@ -104,6 +104,11 @@ class Config:
     confidence_densify: bool = True
     densify_confidence_min: float = 0.15
     densify_confidence_power: float = 1.0
+    # Curriculum confidence: preserve early high-frequency growth, then
+    # smoothly introduce noise-aware filtering before late densification.
+    confidence_curriculum: bool = False
+    confidence_curriculum_start: int = 500
+    confidence_curriculum_end: int = 4_000
     # Protect dark but structurally reliable edges. Image gradients are
     # normalized by the predicted noise of a pixel difference, sqrt(2)*sigma.
     structure_protection: bool = False
@@ -890,9 +895,32 @@ class Runner:
                             * (1.0 - mean_confidence)
                             * color_evidence
                         )
+                    active_confidence_power = cfg.densify_confidence_power
+                    active_confidence_min = cfg.densify_confidence_min
+                    curriculum_weight = 1.0
+                    if cfg.confidence_curriculum:
+                        curriculum_range = max(
+                            cfg.confidence_curriculum_end
+                            - cfg.confidence_curriculum_start,
+                            1,
+                        )
+                        progress = min(
+                            max(
+                                (step - cfg.confidence_curriculum_start)
+                                / curriculum_range,
+                                0.0,
+                            ),
+                            1.0,
+                        )
+                        # Smoothstep avoids an abrupt densification transition.
+                        curriculum_weight = progress * progress * (
+                            3.0 - 2.0 * progress
+                        )
+                        active_confidence_power *= curriculum_weight
+                        active_confidence_min *= curriculum_weight
                     if cfg.confidence_densify and cfg.noise_aware:
                         grads = grads * densify_gaussian_confidence.pow(
-                            cfg.densify_confidence_power
+                            active_confidence_power
                         )
 
                     consensus = self.running_stats["grad_world"].norm(dim=-1) / (
@@ -916,7 +944,7 @@ class Runner:
                     is_grad_high = grads >= cfg.grow_grad2d
                     if cfg.confidence_densify and cfg.noise_aware:
                         is_grad_high = is_grad_high & (
-                            densify_gaussian_confidence >= cfg.densify_confidence_min
+                            densify_gaussian_confidence >= active_confidence_min
                         )
                     if cfg.gradient_consensus and cfg.noise_aware:
                         is_grad_high = is_grad_high & (
@@ -943,6 +971,22 @@ class Runner:
                         self.writer.add_scalar(
                             "color_consistency/densify_confidence_mean",
                             densify_gaussian_confidence.mean().item(),
+                            step,
+                        )
+                    if cfg.confidence_curriculum and cfg.tb_every > 0:
+                        self.writer.add_scalar(
+                            "confidence_curriculum/weight",
+                            curriculum_weight,
+                            step,
+                        )
+                        self.writer.add_scalar(
+                            "confidence_curriculum/active_power",
+                            active_confidence_power,
+                            step,
+                        )
+                        self.writer.add_scalar(
+                            "confidence_curriculum/active_min",
+                            active_confidence_min,
                             step,
                         )
                     is_small = (

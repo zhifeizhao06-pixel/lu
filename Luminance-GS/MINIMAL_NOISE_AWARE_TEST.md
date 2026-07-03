@@ -24,6 +24,8 @@ enabled by default. It adds:
 11. Noise-normalized structure protection restores densification confidence at
     dark edges only when their gradient exceeds the predicted difference-noise
     floor. This targets texture loss caused by intensity-only confidence.
+12. Confidence curriculum keeps early densification permissive and smoothly
+    introduces the full noise-aware threshold between steps 500 and 4000.
 
 The validated default method enables noise-aware confidence densification and
 needle regularization (`5e-4`). Gradient consensus and both Fisher applications
@@ -86,6 +88,10 @@ python simple_trainer_ours.py --help
 - Structure-protected main version:
   `--noise-aware --confidence-densify --structure-protection
   --needle-regularization --no-gradient-consensus --no-information-guidance`
+- Curriculum main version:
+  `--noise-aware --confidence-densify --confidence-curriculum
+  --no-structure-protection --needle-regularization
+  --no-gradient-consensus --no-information-guidance`
 - Original loss and densification:
   `--no-noise-aware --no-confidence-densify --no-gradient-consensus
   --no-needle-regularization`
