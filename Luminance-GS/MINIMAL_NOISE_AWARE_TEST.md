@@ -26,6 +26,9 @@ enabled by default. It adds:
     floor. This targets texture loss caused by intensity-only confidence.
 12. Confidence curriculum keeps early densification permissive and smoothly
     introduces the full noise-aware threshold between steps 500 and 4000.
+13. Evidence-adaptive confidence is a spatial alternative: each Gaussian uses
+    its observation count in the current refinement window to decide how much
+    the confidence estimate should be trusted.
 
 The validated default method enables noise-aware confidence densification and
 needle regularization (`5e-4`). Gradient consensus and both Fisher applications
@@ -91,6 +94,10 @@ python simple_trainer_ours.py --help
 - Curriculum main version:
   `--noise-aware --confidence-densify --confidence-curriculum
   --no-structure-protection --needle-regularization
+  --no-gradient-consensus --no-information-guidance`
+- Evidence-adaptive main version:
+  `--noise-aware --confidence-densify --evidence-adaptive-confidence
+  --no-confidence-curriculum --needle-regularization
   --no-gradient-consensus --no-information-guidance`
 - Original loss and densification:
   `--no-noise-aware --no-confidence-densify --no-gradient-consensus
