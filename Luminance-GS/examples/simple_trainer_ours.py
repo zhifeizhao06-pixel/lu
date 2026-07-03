@@ -104,6 +104,12 @@ class Config:
     confidence_densify: bool = True
     densify_confidence_min: float = 0.15
     densify_confidence_power: float = 1.0
+    # Protect dark but structurally reliable edges. Image gradients are
+    # normalized by the predicted noise of a pixel difference, sqrt(2)*sigma.
+    structure_protection: bool = True
+    edge_snr_low: float = 2.0
+    edge_snr_high: float = 5.0
+    structure_strength: float = 0.5
     # Accumulate image-plane gradients in a common world coordinate system.
     # Noise produces poorly aligned directions across views; real structure is
     # expected to generate a more coherent update direction.
@@ -467,14 +473,29 @@ class Runner:
         }
 
     def _noise_model(self, pixels: Tensor, image_ids: Tensor):
-        """Return heteroscedastic variance and detached signal confidence."""
+        """Return variance, signal confidence, and noise-normalized structure."""
         params = F.softplus(self.noise_params[image_ids.long()])
         alpha = params[:, 0].clamp(1e-5, 0.25)[:, None, None, None]
         beta = params[:, 1].clamp(1e-6, 0.05)[:, None, None, None]
         intensity = pixels.mean(dim=-1, keepdim=True).clamp(0.0, 1.0)
         variance = (alpha * intensity + beta).clamp_min(1e-6)
         confidence = intensity / (intensity + variance.sqrt() + 1e-6)
-        return variance, confidence.detach()
+
+        gray = intensity.permute(0, 3, 1, 2)
+        grad_x = gray[:, :, :, 1:] - gray[:, :, :, :-1]
+        grad_y = gray[:, :, 1:, :] - gray[:, :, :-1, :]
+        grad_x = F.pad(grad_x, (0, 1, 0, 0))
+        grad_y = F.pad(grad_y, (0, 0, 0, 1))
+        gradient = torch.sqrt(grad_x.square() + grad_y.square() + 1e-12)
+        gradient = gradient.permute(0, 2, 3, 1)
+
+        # Independent neighboring samples have approximately twice the noise
+        # variance in their difference. Values above edge_snr_high are treated
+        # as reliable structure rather than sensor noise.
+        edge_snr = gradient / (math.sqrt(2.0) * variance.sqrt() + 1e-6)
+        snr_range = max(self.cfg.edge_snr_high - self.cfg.edge_snr_low, 1e-6)
+        structure = ((edge_snr - self.cfg.edge_snr_low) / snr_range).clamp(0.0, 1.0)
+        return variance, confidence.detach(), structure.detach()
 
     def rasterize_splats(
         self,
@@ -693,8 +714,19 @@ class Runner:
 
             noise_nll = torch.zeros((), device=device)
             signal_confidence = None
+            structure_confidence = None
+            densify_confidence = None
             if cfg.noise_aware:
-                noise_variance, signal_confidence = self._noise_model(pixels, image_ids)
+                (
+                    noise_variance,
+                    signal_confidence,
+                    structure_confidence,
+                ) = self._noise_model(pixels, image_ids)
+                densify_confidence = signal_confidence
+                if cfg.structure_protection:
+                    densify_confidence = signal_confidence + cfg.structure_strength * (
+                        1.0 - signal_confidence
+                    ) * structure_confidence
                 residual2 = (colors_low - pixels).square().mean(dim=-1, keepdim=True)
                 noise_nll = 0.5 * (
                     residual2 / noise_variance + torch.log(noise_variance)
@@ -785,6 +817,21 @@ class Runner:
                     noise_values = F.softplus(self.noise_params[image_ids.long()]).mean(0)
                     self.writer.add_scalar("train/noise_alpha", noise_values[0].item(), step)
                     self.writer.add_scalar("train/noise_beta", noise_values[1].item(), step)
+                    self.writer.add_scalar(
+                        "train/signal_confidence",
+                        signal_confidence.mean().item(),
+                        step,
+                    )
+                    self.writer.add_scalar(
+                        "train/structure_confidence",
+                        structure_confidence.mean().item(),
+                        step,
+                    )
+                    self.writer.add_scalar(
+                        "train/densify_confidence",
+                        densify_confidence.mean().item(),
+                        step,
+                    )
                 if cfg.needle_regularization:
                     self.writer.add_scalar("train/needle_loss", needle_loss.item(), step)
                 self.writer.add_scalar(
@@ -806,7 +853,7 @@ class Runner:
             # update running stats for prunning & growing
             if step < cfg.refine_stop_iter:
                 self.update_running_stats(
-                    info, signal_confidence, camtoworlds.detach(), Ks.detach()
+                    info, densify_confidence, camtoworlds.detach(), Ks.detach()
                 )
 
                 if step > cfg.refine_start_iter and step % cfg.refine_every == 0:

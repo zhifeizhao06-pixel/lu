@@ -21,6 +21,9 @@ enabled by default. It adds:
 10. Parameter-update decoupling: position Fisher gates center updates and shape
     Fisher gates scale/rotation updates, while appearance remains unconstrained.
     Direct Fisher densification is retained only as a disabled ablation.
+11. Noise-normalized structure protection restores densification confidence at
+    dark edges only when their gradient exceeds the predicted difference-noise
+    floor. This targets texture loss caused by intensity-only confidence.
 
 The validated default method enables noise-aware confidence densification and
 needle regularization (`5e-4`). Gradient consensus and both Fisher applications
@@ -78,6 +81,9 @@ python simple_trainer_ours.py --help
   `--noise-aware --confidence-densify --no-gradient-consensus
   --needle-regularization --information-guidance
   --information-gradient-gating --no-information-densify`
+- Structure-protected main version:
+  `--noise-aware --confidence-densify --structure-protection
+  --needle-regularization --no-gradient-consensus --no-information-guidance`
 - Original loss and densification:
   `--no-noise-aware --no-confidence-densify --no-gradient-consensus
   --no-needle-regularization`
@@ -99,6 +105,8 @@ python simple_trainer_ours.py --help
   floaters by itself. `opacity_weighted_needle` reduces the influence of
   nearly invisible outliers.
 - `train/noise_alpha`, `train/noise_beta`, and `train/noise_nll` in TensorBoard.
+- `train/signal_confidence`, `train/structure_confidence`, and
+  `train/densify_confidence` show how much edge evidence restores confidence.
 - `information_supported_fraction`, `information_mean`,
   `information_median`, `information_below_min`, `position_gate_mean`, and
   `shape_gate_mean` in checkpoint statistics.
