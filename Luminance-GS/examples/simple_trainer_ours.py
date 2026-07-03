@@ -110,6 +110,15 @@ class Config:
     edge_snr_low: float = 2.0
     edge_snr_high: float = 5.0
     structure_strength: float = 0.5
+    # Cross-view contribution-aware protection. The DC color gradient already
+    # contains visibility, alpha-compositing and residual information, and is
+    # directly comparable across views in RGB space.
+    color_consistency_protection: bool = False
+    color_consistency_start: int = 1_000
+    color_consistency_decay: float = 0.95
+    color_consistency_min_support: int = 3
+    color_gradient_relative_min: float = 0.1
+    color_consistency_strength: float = 0.5
     # Accumulate image-plane gradients in a common world coordinate system.
     # Noise produces poorly aligned directions across views; real structure is
     # expected to generate a more coherent update direction.
@@ -470,6 +479,9 @@ class Runner:
             "fisher_position": torch.zeros(n_gauss, device=self.device),
             "fisher_shape": torch.zeros(n_gauss, device=self.device),
             "view_support": torch.zeros(n_gauss, device=self.device),
+            "color_direction_ema": torch.zeros(n_gauss, 3, device=self.device),
+            "color_strength_ema": torch.zeros(n_gauss, device=self.device),
+            "color_support": torch.zeros(n_gauss, device=self.device),
         }
 
     def _noise_model(self, pixels: Tensor, image_ids: Tensor):
@@ -798,6 +810,11 @@ class Runner:
 
             if information_grads is not None:
                 self.update_fisher_stats(info, information_grads)
+            if (
+                cfg.color_consistency_protection
+                and step >= cfg.color_consistency_start
+            ):
+                self.update_color_consistency_stats(info)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
 
@@ -864,8 +881,19 @@ class Runner:
                     mean_confidence = self.running_stats["confidence"] / self.running_stats[
                         "count"
                     ].clamp_min(1)
+                    densify_gaussian_confidence = mean_confidence
+                    color_evidence = None
+                    if cfg.color_consistency_protection:
+                        color_evidence, _, _ = self.get_color_consistency_evidence()
+                        densify_gaussian_confidence = mean_confidence + (
+                            cfg.color_consistency_strength
+                            * (1.0 - mean_confidence)
+                            * color_evidence
+                        )
                     if cfg.confidence_densify and cfg.noise_aware:
-                        grads = grads * mean_confidence.pow(cfg.densify_confidence_power)
+                        grads = grads * densify_gaussian_confidence.pow(
+                            cfg.densify_confidence_power
+                        )
 
                     consensus = self.running_stats["grad_world"].norm(dim=-1) / (
                         self.running_stats["confidence"].clamp_min(1e-6)
@@ -888,7 +916,7 @@ class Runner:
                     is_grad_high = grads >= cfg.grow_grad2d
                     if cfg.confidence_densify and cfg.noise_aware:
                         is_grad_high = is_grad_high & (
-                            mean_confidence >= cfg.densify_confidence_min
+                            densify_gaussian_confidence >= cfg.densify_confidence_min
                         )
                     if cfg.gradient_consensus and cfg.noise_aware:
                         is_grad_high = is_grad_high & (
@@ -905,6 +933,17 @@ class Runner:
                         is_grad_high = is_grad_high & (
                             (~has_support)
                             | (information_confidence >= cfg.information_min)
+                        )
+                    if color_evidence is not None and cfg.tb_every > 0:
+                        self.writer.add_scalar(
+                            "color_consistency/evidence_mean",
+                            color_evidence.mean().item(),
+                            step,
+                        )
+                        self.writer.add_scalar(
+                            "color_consistency/densify_confidence_mean",
+                            densify_gaussian_confidence.mean().item(),
+                            step,
                         )
                     is_small = (
                         torch.exp(self.splats["scales"]).max(dim=-1).values
@@ -1122,6 +1161,35 @@ class Runner:
                                 .item(),
                             }
                         )
+                if cfg.color_consistency_protection:
+                    color_evidence, color_coherence, color_strength = (
+                        self.get_color_consistency_evidence()
+                    )
+                    color_supported = self.running_stats["color_support"] >= (
+                        cfg.color_consistency_min_support
+                    )
+                    stats.update(
+                        {
+                            "color_supported_fraction": color_supported.float()
+                            .mean()
+                            .item(),
+                            "color_evidence_mean": color_evidence[
+                                color_supported
+                            ].mean().item()
+                            if color_supported.any()
+                            else 0.0,
+                            "color_coherence_mean": color_coherence[
+                                color_supported
+                            ].mean().item()
+                            if color_supported.any()
+                            else 0.0,
+                            "color_strength_mean": color_strength[
+                                color_supported
+                            ].mean().item()
+                            if color_supported.any()
+                            else 0.0,
+                        }
+                    )
                 for key in (
                     "elongation_mean",
                     "elongation_gt5",
@@ -1147,6 +1215,16 @@ class Runner:
                 ):
                     if key in stats:
                         self.writer.add_scalar(f"information/{key}", stats[key], step)
+                for key in (
+                    "color_supported_fraction",
+                    "color_evidence_mean",
+                    "color_coherence_mean",
+                    "color_strength_mean",
+                ):
+                    if key in stats:
+                        self.writer.add_scalar(
+                            f"color_consistency/{key}", stats[key], step
+                        )
                 print("Step: ", step, stats)
                 with open(f"{self.stats_dir}/train_step{step:04d}.json", "w") as f:
                     json.dump(stats, f)
@@ -1179,6 +1257,70 @@ class Runner:
                 self.viewer.state.num_train_rays_per_sec = num_train_rays_per_sec
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+    @torch.no_grad()
+    def update_color_consistency_stats(self, info: Dict):
+        """Accumulate contribution-aware DC-color gradient directions."""
+        color_grad = self.splats["sh0"].grad
+        if color_grad is None:
+            return
+        if color_grad.is_sparse:
+            color_grad = color_grad.to_dense()
+        color_grad = color_grad.detach().float()[:, 0, :]
+        magnitude = color_grad.norm(dim=-1)
+
+        if self.cfg.packed:
+            visible = torch.zeros(
+                len(color_grad), device=self.device, dtype=torch.bool
+            )
+            visible[info["gaussian_ids"].unique()] = True
+        else:
+            visible = (info["radii"] > 0).any(dim=0)
+
+        positive = visible & torch.isfinite(magnitude) & (magnitude > 0)
+        if not positive.any():
+            return
+        reference = magnitude[positive].median().clamp_min(1e-12)
+        valid = positive & (
+            magnitude >= reference * self.cfg.color_gradient_relative_min
+        )
+        if not valid.any():
+            return
+
+        direction = F.normalize(color_grad[valid], dim=-1, eps=1e-12)
+        decay = self.cfg.color_consistency_decay
+        self.running_stats["color_direction_ema"][valid] = (
+            decay * self.running_stats["color_direction_ema"][valid]
+            + (1.0 - decay) * direction
+        )
+        self.running_stats["color_strength_ema"][valid] = (
+            decay * self.running_stats["color_strength_ema"][valid]
+            + (1.0 - decay) * magnitude[valid]
+        )
+        self.running_stats["color_support"][valid] += 1.0
+
+    @torch.no_grad()
+    def get_color_consistency_evidence(self):
+        """Return combined evidence, directional coherence, and strength."""
+        support_count = self.running_stats["color_support"]
+        supported = support_count >= self.cfg.color_consistency_min_support
+        bias = 1.0 - self.cfg.color_consistency_decay ** support_count.clamp_min(1.0)
+
+        direction_mean = self.running_stats["color_direction_ema"] / bias[:, None]
+        coherence = direction_mean.norm(dim=-1).clamp(0.0, 1.0)
+        strength = self.running_stats["color_strength_ema"] / bias
+
+        strength_confidence = torch.zeros_like(strength)
+        positive = supported & torch.isfinite(strength) & (strength > 0)
+        if positive.any():
+            reference = strength[positive].median().clamp_min(1e-20)
+            strength_confidence[positive] = strength[positive] / (
+                strength[positive] + reference
+            )
+
+        coherence = coherence * supported.float()
+        evidence = coherence * strength_confidence.sqrt()
+        return evidence.clamp(0.0, 1.0), coherence, strength_confidence
 
     @torch.no_grad()
     def update_fisher_stats(self, info: Dict, information_grads):
