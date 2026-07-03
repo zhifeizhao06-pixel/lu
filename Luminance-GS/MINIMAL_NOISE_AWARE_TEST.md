@@ -28,6 +28,8 @@ enabled by default. It adds:
 The validated default method enables noise-aware confidence densification and
 needle regularization (`5e-4`). Gradient consensus and both Fisher applications
 are disabled by default because they reduced validation quality on `buu`.
+Single-view structure protection is also disabled: sRGB ISP noise violated the
+simple gradient-SNR assumption and substantially reduced perceptual quality.
 
 ## A/B commands
 

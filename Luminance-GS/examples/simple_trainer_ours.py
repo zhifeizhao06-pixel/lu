@@ -106,7 +106,7 @@ class Config:
     densify_confidence_power: float = 1.0
     # Protect dark but structurally reliable edges. Image gradients are
     # normalized by the predicted noise of a pixel difference, sqrt(2)*sigma.
-    structure_protection: bool = True
+    structure_protection: bool = False
     edge_snr_low: float = 2.0
     edge_snr_high: float = 5.0
     structure_strength: float = 0.5
