@@ -4,7 +4,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from turtle import color
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import imageio
 import numpy as np
@@ -44,6 +44,7 @@ from rendering_double import rasterization_dual
 
 from tools import pixel_project, pixel_project_back, LUT_mapping
 from losses import L_spa, HistogramPriorLoss, gamma_curve, s_curve
+from experiment_utils import curriculum_weight
 
 
 @dataclass
@@ -74,6 +75,8 @@ class Config:
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
+    # Random seed used for initialization, camera sampling, and data loading.
+    seed: int = 42
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
 
@@ -96,9 +99,13 @@ class Config:
     # Low-light noise-aware optimization.  We use the common heteroscedastic
     # approximation Var[n] = alpha * intensity + beta for shot/read noise.
     noise_aware: bool = True
+    # fixed: constant variance; linear: alpha * observed intensity + beta;
+    # poisson_read: alpha * predicted intensity + beta (Gaussian approximation).
+    noise_model: Literal["fixed", "linear", "poisson_read"] = "linear"
     noise_nll_lambda: float = 0.05
     noise_alpha_init: float = 0.01
     noise_beta_init: float = 0.001
+    noise_fixed_variance: float = 0.001
     # Suppress densification when a Gaussian is observed mostly below the
     # estimated noise floor. Set to 0 to recover the original densification.
     confidence_densify: bool = True
@@ -107,8 +114,12 @@ class Config:
     # Curriculum confidence: preserve early high-frequency growth, then
     # smoothly introduce noise-aware filtering before late densification.
     confidence_curriculum: bool = False
+    confidence_schedule: Literal["fixed", "step", "linear", "smoothstep", "exponential"] = "smoothstep"
     confidence_curriculum_start: int = 500
     confidence_curriculum_end: int = 4_000
+    # Used only by the hard-step schedule. None selects the interval midpoint.
+    confidence_curriculum_step: Optional[int] = None
+    confidence_schedule_exp_rate: float = 5.0
     # Per-Gaussian alternative to the global curriculum. Observation support
     # is accumulated within each refinement window; weakly observed Gaussians
     # are not rejected until their confidence estimate becomes reliable.
@@ -222,6 +233,12 @@ class Config:
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+    # Disable these for large supplementary sweeps to reduce disk and runtime.
+    save_eval_images: bool = True
+    render_trajectory: bool = True
+    # Report reconstruction quality separately in dark/mid/bright regions.
+    eval_dark_threshold: float = 0.10
+    eval_bright_threshold: float = 0.50
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -232,20 +249,49 @@ class Config:
         self.refine_stop_iter = int(self.refine_stop_iter * factor)
         self.reset_every = int(self.reset_every * factor)
         self.refine_every = int(self.refine_every * factor)
+        self.confidence_curriculum_start = int(
+            self.confidence_curriculum_start * factor
+        )
+        self.confidence_curriculum_end = int(
+            self.confidence_curriculum_end * factor
+        )
+        if self.confidence_curriculum_step is not None:
+            self.confidence_curriculum_step = int(
+                self.confidence_curriculum_step * factor
+            )
+        self.needle_reg_start = int(self.needle_reg_start * factor)
 
-cfg = tyro.cli(Config)
 
-# if cfg.exp_name in ["low", "over_exp"]:
-#     from datasets.colmap import Dataset, Parser
-# else:
-#     from datasets.colmap_mip360 import Dataset, Parser
-if cfg.exp_name in ["low", "over_exp"]:
-    from datasets.colmap import Dataset, Parser
-elif cfg.exp_name == "variance":
-    from datasets.colmap_mip360 import Dataset, Parser
-else:
-    from datasets.colmap import Dataset, Parser
-    # from datasets.colmap_mip360_WB import Dataset, Parser
+def load_dataset_classes(exp_name: str):
+    """Import the dataset lazily so this module can be imported by tests."""
+    if exp_name == "variance":
+        from datasets.colmap_mip360 import Dataset, Parser
+    else:
+        from datasets.colmap import Dataset, Parser
+    return Dataset, Parser
+
+
+def validate_config(cfg: Config) -> None:
+    if cfg.seed < 0:
+        raise ValueError("--seed must be non-negative.")
+    if cfg.noise_fixed_variance <= 0:
+        raise ValueError("--noise-fixed-variance must be positive.")
+    if cfg.confidence_curriculum_end <= cfg.confidence_curriculum_start:
+        raise ValueError(
+            "--confidence-curriculum-end must be greater than the start."
+        )
+    if cfg.confidence_schedule_exp_rate <= 0:
+        raise ValueError("--confidence-schedule-exp-rate must be positive.")
+    if not 0 <= cfg.densify_confidence_min <= 1:
+        raise ValueError("--densify-confidence-min must lie in [0, 1].")
+    if cfg.densify_confidence_power < 0:
+        raise ValueError("--densify-confidence-power must be non-negative.")
+    if cfg.needle_ratio_max <= 1:
+        raise ValueError("--needle-ratio-max must be greater than 1.")
+    if cfg.needle_reg_lambda < 0 or cfg.noise_nll_lambda < 0:
+        raise ValueError("Loss weights must be non-negative.")
+    if not 0 < cfg.eval_dark_threshold < cfg.eval_bright_threshold < 1:
+        raise ValueError("Evaluation thresholds must satisfy 0 < dark < bright < 1.")
 
 
 def create_splats_with_optimizers(
@@ -314,7 +360,8 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(self, cfg: Config) -> None:
-        set_random_seed(42)
+        validate_config(cfg)
+        set_random_seed(cfg.seed)
 
         self.cfg = cfg
         self.device = "cuda"
@@ -336,6 +383,7 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
+        Dataset, Parser = load_dataset_classes(cfg.exp_name)
         self.parser = Parser(
             data_dir=cfg.data_dir,
             exp_name = cfg.exp_name,
@@ -422,7 +470,7 @@ class Runner:
             noise_init[None].repeat(len(self.trainset), 1)
         )
         self.noise_optimizers = []
-        if cfg.noise_aware:
+        if cfg.noise_aware and cfg.noise_model != "fixed":
             self.noise_optimizers = [
                 torch.optim.Adam([self.noise_params], lr=2e-4, weight_decay=1e-6)
             ]
@@ -494,13 +542,40 @@ class Runner:
             "color_support": torch.zeros(n_gauss, device=self.device),
         }
 
-    def _noise_model(self, pixels: Tensor, image_ids: Tensor):
-        """Return variance, signal confidence, and noise-normalized structure."""
-        params = F.softplus(self.noise_params[image_ids.long()])
-        alpha = params[:, 0].clamp(1e-5, 0.25)[:, None, None, None]
-        beta = params[:, 1].clamp(1e-6, 0.05)[:, None, None, None]
+    def _noise_model(
+        self,
+        pixels: Tensor,
+        image_ids: Tensor,
+        predicted_pixels: Optional[Tensor] = None,
+    ):
+        """Return variance, signal confidence, and noise-normalized structure.
+
+        ``linear`` reproduces the original implementation and evaluates the
+        variance at observed sRGB intensity. ``poisson_read`` evaluates the
+        shot component at the current predicted intensity (detached so geometry
+        cannot lower the loss by manipulating its variance). ``fixed`` is the
+        homoscedastic control used in the supplementary ablation.
+        """
         intensity = pixels.mean(dim=-1, keepdim=True).clamp(0.0, 1.0)
-        variance = (alpha * intensity + beta).clamp_min(1e-6)
+        if self.cfg.noise_model == "fixed":
+            variance = torch.full_like(intensity, self.cfg.noise_fixed_variance)
+        else:
+            params = F.softplus(self.noise_params[image_ids.long()])
+            alpha = params[:, 0].clamp(1e-5, 0.25)[:, None, None, None]
+            beta = params[:, 1].clamp(1e-6, 0.05)[:, None, None, None]
+            if self.cfg.noise_model == "poisson_read":
+                if predicted_pixels is None:
+                    raise ValueError(
+                        "poisson_read requires rendered pixels for its variance."
+                    )
+                variance_intensity = (
+                    predicted_pixels.detach()
+                    .mean(dim=-1, keepdim=True)
+                    .clamp(0.0, 1.0)
+                )
+            else:
+                variance_intensity = intensity
+            variance = (alpha * variance_intensity + beta).clamp_min(1e-6)
         confidence = intensity / (intensity + variance.sqrt() + 1e-6)
 
         gray = intensity.permute(0, 3, 1, 2)
@@ -601,7 +676,7 @@ class Runner:
                     self.curve_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
-        if cfg.noise_aware:
+        if self.noise_optimizers:
             scheulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
                     self.noise_optimizers[0], gamma=0.1 ** (1.0 / max_steps)
@@ -626,6 +701,8 @@ class Runner:
                 )
             )
 
+        train_generator = torch.Generator()
+        train_generator.manual_seed(cfg.seed)
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
@@ -633,10 +710,12 @@ class Runner:
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
+            generator=train_generator,
         )
         trainloader_iter = iter(trainloader)
 
         # Training loop.
+        torch.cuda.reset_peak_memory_stats(device)
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
@@ -743,7 +822,7 @@ class Runner:
                     noise_variance,
                     signal_confidence,
                     structure_confidence,
-                ) = self._noise_model(pixels, image_ids)
+                ) = self._noise_model(pixels, image_ids, colors_low)
                 densify_confidence = signal_confidence
                 if cfg.structure_protection:
                     densify_confidence = signal_confidence + cfg.structure_strength * (
@@ -841,9 +920,22 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 if cfg.noise_aware:
                     self.writer.add_scalar("train/noise_nll", noise_nll.item(), step)
-                    noise_values = F.softplus(self.noise_params[image_ids.long()]).mean(0)
-                    self.writer.add_scalar("train/noise_alpha", noise_values[0].item(), step)
-                    self.writer.add_scalar("train/noise_beta", noise_values[1].item(), step)
+                    if cfg.noise_model == "fixed":
+                        self.writer.add_scalar(
+                            "train/noise_fixed_variance",
+                            cfg.noise_fixed_variance,
+                            step,
+                        )
+                    else:
+                        noise_values = F.softplus(
+                            self.noise_params[image_ids.long()]
+                        ).mean(0)
+                        self.writer.add_scalar(
+                            "train/noise_alpha", noise_values[0].item(), step
+                        )
+                        self.writer.add_scalar(
+                            "train/noise_beta", noise_values[1].item(), step
+                        )
                     self.writer.add_scalar(
                         "train/signal_confidence",
                         signal_confidence.mean().item(),
@@ -913,27 +1005,18 @@ class Runner:
                         )
                     active_confidence_power = cfg.densify_confidence_power
                     active_confidence_min = cfg.densify_confidence_min
-                    curriculum_weight = 1.0
+                    active_curriculum_weight = 1.0
                     if cfg.confidence_curriculum:
-                        curriculum_range = max(
-                            cfg.confidence_curriculum_end
-                            - cfg.confidence_curriculum_start,
-                            1,
+                        active_curriculum_weight = curriculum_weight(
+                            step=step,
+                            start=cfg.confidence_curriculum_start,
+                            end=cfg.confidence_curriculum_end,
+                            schedule=cfg.confidence_schedule,
+                            exponential_rate=cfg.confidence_schedule_exp_rate,
+                            step_iteration=cfg.confidence_curriculum_step,
                         )
-                        progress = min(
-                            max(
-                                (step - cfg.confidence_curriculum_start)
-                                / curriculum_range,
-                                0.0,
-                            ),
-                            1.0,
-                        )
-                        # Smoothstep avoids an abrupt densification transition.
-                        curriculum_weight = progress * progress * (
-                            3.0 - 2.0 * progress
-                        )
-                        active_confidence_power *= curriculum_weight
-                        active_confidence_min *= curriculum_weight
+                        active_confidence_power *= active_curriculum_weight
+                        active_confidence_min *= active_curriculum_weight
                     if cfg.confidence_densify and cfg.noise_aware:
                         grads = grads * densify_gaussian_confidence.pow(
                             active_confidence_power
@@ -992,7 +1075,7 @@ class Runner:
                     if cfg.confidence_curriculum and cfg.tb_every > 0:
                         self.writer.add_scalar(
                             "confidence_curriculum/weight",
-                            curriculum_weight,
+                            active_curriculum_weight,
                             step,
                         )
                         self.writer.add_scalar(
@@ -1147,12 +1230,33 @@ class Runner:
 
             # save checkpoint
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
+                peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
+                training_time_sec = time.time() - global_tic
                 stats = {
-                    "mem": mem,
-                    "ellipse_time": time.time() - global_tic,
+                    # Keep legacy keys for existing comparison scripts.
+                    "mem": peak_memory_gb,
+                    "ellipse_time": training_time_sec,
+                    "peak_memory_gb": peak_memory_gb,
+                    "training_time_sec": training_time_sec,
+                    "seed": cfg.seed,
+                    "noise_model": cfg.noise_model,
+                    "confidence_schedule": cfg.confidence_schedule
+                    if cfg.confidence_curriculum
+                    else "fixed",
                     "num_GS": len(self.splats["means3d"]),
                 }
+                if cfg.noise_aware:
+                    if cfg.noise_model == "fixed":
+                        stats["noise_fixed_variance"] = cfg.noise_fixed_variance
+                    else:
+                        effective_noise = F.softplus(self.noise_params.detach())
+                        alpha_values = effective_noise[:, 0].clamp(1e-5, 0.25)
+                        beta_values = effective_noise[:, 1].clamp(1e-6, 0.05)
+                        for name, values in (("alpha", alpha_values), ("beta", beta_values)):
+                            stats[f"noise_{name}_mean"] = values.mean().item()
+                            stats[f"noise_{name}_std"] = values.std(unbiased=False).item()
+                            stats[f"noise_{name}_min"] = values.min().item()
+                            stats[f"noise_{name}_max"] = values.max().item()
                 scales = torch.exp(self.splats["scales"].detach())
                 sorted_scales = scales.sort(dim=-1).values
                 elongation = sorted_scales[:, 2] / sorted_scales[:, 0].clamp_min(1e-8)
@@ -1316,7 +1420,8 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
-                self.render_traj(step)
+                if cfg.render_trajectory:
+                    self.render_traj(step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -1665,6 +1770,8 @@ class Runner:
         )
         ellipse_time = 0
         metrics = {"psnr": [], "ssim": [], "lpips": []}
+        region_sq_error = {"dark": 0.0, "mid": 0.0, "bright": 0.0}
+        region_pixels = {"dark": 0, "mid": 0, "bright": 0}
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -1692,24 +1799,42 @@ class Runner:
             torch.cuda.synchronize()
             ellipse_time += time.time() - tic
 
-            # write images
-            
-            canvas = torch.cat([colors_low, colors_enh], dim=2).squeeze(0).cpu().numpy()
-            
-            imageio.imwrite(
-                f"{self.render_dir_depth}/val_{i:04d}_depth_low.png", (depth_low.squeeze(0).squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
-            )
+            # Save images only when requested; large multi-seed sweeps can
+            # otherwise consume substantial disk space.
+            if cfg.save_eval_images:
+                imageio.imwrite(
+                    f"{self.render_dir_depth}/val_{i:04d}_depth_low.png",
+                    (depth_low.squeeze(0).squeeze(-1).cpu().numpy() * 255).astype(np.uint8),
+                )
+                imageio.imwrite(
+                    f"{self.render_dir_depth}/val_{i:04d}_depth_enh.png",
+                    (depth_enh.squeeze(0).squeeze(-1).cpu().numpy() * 255).astype(np.uint8),
+                )
+                imageio.imwrite(
+                    f"{self.render_dir}/val_{i:04d}_low.png",
+                    (colors_low.squeeze(0).cpu().numpy() * 255).astype(np.uint8),
+                )
+                imageio.imwrite(
+                    f"{self.render_dir}/val_{i:04d}_enh.png",
+                    (colors_enh.squeeze(0).cpu().numpy() * 255).astype(np.uint8),
+                )
 
-            imageio.imwrite(
-                f"{self.render_dir_depth}/val_{i:04d}_depth_enh.png", (depth_enh.squeeze(0).squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
-            )
-
-            imageio.imwrite(
-                f"{self.render_dir}/val_{i:04d}_low.png", (colors_low.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            )
-            imageio.imwrite(
-                f"{self.render_dir}/val_{i:04d}_enh.png", (colors_enh.squeeze(0).cpu().numpy() * 255).astype(np.uint8)
-            )
+            # Intensity-stratified metrics expose dark-region failures that
+            # can be hidden by a single full-image PSNR. Thresholds are
+            # applied to ground-truth luminance, not the prediction.
+            gt_luminance = pixels.mean(dim=-1)
+            pixel_mse = (colors_enh - pixels).pow(2).mean(dim=-1)
+            region_masks = {
+                "dark": gt_luminance < cfg.eval_dark_threshold,
+                "mid": (gt_luminance >= cfg.eval_dark_threshold)
+                & (gt_luminance < cfg.eval_bright_threshold),
+                "bright": gt_luminance >= cfg.eval_bright_threshold,
+            }
+            for region, mask in region_masks.items():
+                count = int(mask.sum().item())
+                if count:
+                    region_sq_error[region] += pixel_mse[mask].sum().item()
+                    region_pixels[region] += count
 
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors_enh = colors_enh.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -1728,12 +1853,33 @@ class Runner:
             f"Number of GS: {len(self.splats['means3d'])}"
         )
         # save stats as json
+        checkpoint_path = f"{self.ckpt_dir}/ckpt_{step}.pt"
+        checkpoint_size_mb = (
+            os.path.getsize(checkpoint_path) / 1024**2
+            if os.path.exists(checkpoint_path)
+            else 0.0
+        )
+        region_stats = {}
+        total_region_pixels = max(sum(region_pixels.values()), 1)
+        for region in ("dark", "mid", "bright"):
+            count = region_pixels[region]
+            region_stats[f"pixel_fraction_{region}"] = count / total_region_pixels
+            if count:
+                mse = max(region_sq_error[region] / count, 1e-12)
+                region_stats[f"psnr_{region}"] = -10.0 * math.log10(mse)
         stats = {
             "psnr": psnr.item(),
             "ssim": ssim.item(),
             "lpips": lpips.item(),
+            # Keep the legacy key while adding publication-facing names.
             "ellipse_time": ellipse_time,
+            "render_time_sec_per_image": ellipse_time,
+            "render_fps": 1.0 / max(ellipse_time, 1e-12),
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1024**3,
+            "checkpoint_size_mb": checkpoint_size_mb,
+            "seed": cfg.seed,
             "num_GS": len(self.splats["means3d"]),
+            **region_stats,
         }
         with open(f"{self.stats_dir}/val_step{step:04d}.json", "w") as f:
             json.dump(stats, f)
@@ -1842,7 +1988,8 @@ def main(cfg: Config):
         ):
             runner.noise_params.data.copy_(ckpt["noise_params"])
         runner.eval(step=ckpt["step"])
-        runner.render_traj(step=ckpt["step"])
+        if cfg.render_trajectory:
+            runner.render_traj(step=ckpt["step"])
     else:
         runner.train()
 
